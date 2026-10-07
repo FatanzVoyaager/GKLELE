@@ -1,0 +1,266 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>STR WebRTC</title>
+<style>
+  html,body{margin:0;background:#000;width:100%;height:100%;overflow:hidden;font-family:system-ui,sans-serif}
+  main{width:100%;height:100%;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:12px}
+  #video{width:min(96vw,960px);aspect-ratio:4/3;background:#111;object-fit:contain;display:block}
+  #connect{width:min(96vw,960px);height:48px;border:0;border-radius:8px;font-size:16px;font-weight:600;cursor:pointer}
+</style>
+</head>
+<body>
+<main>
+  <video id="video" autoplay playsinline muted></video>
+  <button id="connect">CONNECT STREAM</button>
+</main>
+<script>
+const video = document.getElementById('video');
+const button = document.getElementById('connect');
+let ws = null;
+let pc = null;
+let remoteIceQueue = [];
+let remoteDescriptionSet = false;
+
+function wsUrl() {
+  const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  return `${protocol}//${location.host}/ws`;
+}
+
+function setButton(text, disabled=false) {
+  button.textContent = text;
+  button.disabled = disabled;
+}
+
+async function addQueuedIce() {
+  for (const candidate of remoteIceQueue) {
+    try { await pc.addIceCandidate(candidate); } catch (e) { console.error(e); }
+  }
+  remoteIceQueue = [];
+}
+
+async function startStream() {
+    if (pc) return;
+
+    setButton('CONNECTING...', true);
+    pc = new RTCPeerConnection({
+        iceServers: [
+            {urls: 'stun:stun.l.google.com:19302'}
+        ]
+    });
+
+    remoteDescriptionSet = false;
+    remoteIceQueue = [];
+    pc.ontrack = (event) => {
+        console.log('[PC] ONTRACK', event);
+        if (event.streams && event.streams[0]) {
+            if (!video.srcObject) {
+                video.srcObject = event.streams[0];
+            }
+            video.play().then(() => {
+                    console.log('[VIDEO] PLAY OK');
+                    setButton('DISCONNECT', false);
+                })
+                .catch(err => {
+                    if (err.name !== 'AbortError') {
+                        console.error('[VIDEO] PLAY FAILED', err);
+                    }
+                });
+        }
+    };
+
+    pc.onicecandidate = (event) => {
+        if (!ws ||ws.readyState !== WebSocket.OPEN || !event.candidate)
+            return;
+
+        ws.send(JSON.stringify({
+            type: 'ice',
+            candidate: event.candidate.candidate,
+            sdpMLineIndex: event.candidate.sdpMLineIndex
+        }));
+    };
+
+    // pc.onconnectionstatechange = () => {
+    //     console.log('[PC] connectionState =', pc.connectionState);
+    //     if (pc.connectionState === 'connected')
+    //         setButton('CONNECTED', false);
+
+    //     if (pc.connectionState === 'connecting')
+    //         setButton('CONNECTING...', true);
+
+    //     if (pc.connectionState === 'disconnected' ||
+    //         pc.connectionState === 'failed' ||
+    //         pc.connectionState === 'closed')
+    //         setButton('CONNECT STREAM', false);
+    // };
+
+    pc.onconnectionstatechange = () => {
+        const state = pc.connectionState;
+        console.log('[PC] connectionState =', state);
+        if (state === 'connected') {
+            setButton('DISCONNECT', false);
+        } else if (state === 'connecting') {
+            setButton('CONNECTING...', true);
+        } else if (state === 'disconnected' || state === 'failed' || state === 'closed') {
+            setButton('CONNECT STREAM', false);
+        }
+    };
+
+    pc.oniceconnectionstatechange = () => {
+        console.log('[PC] iceConnectionState =', pc.iceConnectionState);
+    };
+
+    pc.onsignalingstatechange = () => {
+        console.log('[PC] signalingState =', pc.signalingState);
+    };
+
+    ws = new WebSocket(wsUrl());
+    ws.onopen = () => {
+        console.log('[WS] connected');
+        ws.send(JSON.stringify({type:'start'}));
+    };
+
+  ws.onmessage = async (event) => {
+    let msg;
+    try { msg = JSON.parse(event.data); } catch { return; }
+
+    if (msg.type === 'answer') {
+      try {
+        await pc.setRemoteDescription({type:'answer', sdp:msg.sdp});
+        remoteDescriptionSet = true;
+        await addQueuedIce();
+      } catch (e) {
+        console.error(e);
+        stopStream();
+      }
+    }
+
+    if (msg.type === 'ice') {
+      const candidate = {
+        candidate: msg.candidate,
+        sdpMLineIndex: msg.sdpMLineIndex ?? 0
+      };
+      if (remoteDescriptionSet) {
+        try { await pc.addIceCandidate(candidate); } catch (e) { console.error(e); }
+      } else {
+        remoteIceQueue.push(candidate);
+      }
+    }
+
+    if (msg.type === 'offer') {
+        console.log('[SDP] GStreamer offer received');
+        try {
+            await pc.setRemoteDescription({
+                type: 'offer',
+                sdp: msg.sdp
+            });
+
+            remoteDescriptionSet = true;
+            await addQueuedIce();
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({
+                type: 'answer',
+                sdp: pc.localDescription.sdp
+            }));
+            console.log('[SDP] Browser answer sent');
+        } catch (e) {
+            console.error('[SDP] Answer failed:', e);
+            stopStream();
+        }
+        return;
+    }
+
+    if (msg.type === 'resume') {
+        console.log('[WS] Server resume acknowledged');
+        resumeVideo();
+        return;
+    }
+  };
+
+  ws.onerror = (e) => console.error('WebSocket error', e);
+  ws.onclose = () => {
+    if (pc && pc.connectionState !== 'connected') {
+      setButton('CONNECT STREAM', false);
+    }
+  };
+}
+
+function disconnectStream() {
+    console.log('[WS] User requested DISCONNECT');
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({
+            type: 'stop'
+        }));
+    }
+
+    try {
+        video.pause();
+    } catch {}
+    // PENTING:
+    // jangan video.srcObject = null;
+    //
+    // Track WebRTC tetap dipertahankan.
+    // Kita hanya menghentikan playback sementara.
+    setButton('CONNECT STREAM', false);
+}
+
+function reconnectStream() {
+    console.log('[WS] User requested CONNECT again');
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        console.log('[WS] WebSocket tidak tersedia');
+        // Hanya buat sesi baru jika koneksi benar-benar mati.
+        stopStream();
+        startStream();
+        return;
+    }
+
+    // PeerConnection masih hidup.
+    // Tidak perlu SDP renegotiation.
+    setButton('CONNECTING...', true);
+    ws.send(JSON.stringify({
+        type: 'resume'
+    }));
+}
+
+function resumeVideo() {
+    console.log('[VIDEO] Resume');
+    if (!video.srcObject) {
+        console.warn('[VIDEO] Tidak ada MediaStream');
+        return;
+    }
+
+    video.play().then(() => {
+            console.log('[VIDEO] PLAY OK');
+            setButton('DISCONNECT', false);
+        })
+        .catch(err => {
+            console.error('[VIDEO] RESUME FAILED', err);
+            setButton('CONNECT STREAM', false);
+        });
+}
+
+function stopStream() {
+  if (ws) { try { ws.close(); } catch {} ws = null; }
+  if (pc) { try { pc.close(); } catch {} pc = null; }
+  video.srcObject = null;
+  remoteIceQueue = [];
+  remoteDescriptionSet = false;
+  setButton('CONNECT STREAM', false);
+}
+
+button.addEventListener('click', () => {
+    const label = button.textContent;
+    if (label === 'DISCONNECT') {
+        disconnectStream();
+    } else if (pc && ws && ws.readyState === WebSocket.OPEN && pc.signalingState !== 'closed') {
+        reconnectStream();
+    } else {
+        startStream();
+    }
+});
+</script>
+</body>
+</html>
